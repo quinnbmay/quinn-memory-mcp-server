@@ -4,6 +4,7 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
 import fastify from "fastify";
 import { z } from "zod";
+import Redis from "ioredis";
 
 interface Memory {
   id: string;
@@ -16,6 +17,7 @@ class QuinnMemoryServer {
   private server: Server;
   private memories: Memory[] = [];
   private fastifyServer: any;
+  private redis: Redis;
 
   constructor() {
     this.server = new Server(
@@ -29,6 +31,16 @@ class QuinnMemoryServer {
         },
       }
     );
+
+    // Initialize Redis/DragonflyDB connection
+    this.redis = new Redis({
+      host: process.env.DRAGONFLY_HOST || 'dragonflydb.railway.internal',
+      port: parseInt(process.env.DRAGONFLY_PORT || '6379'),
+      // Fallback to in-memory if Redis unavailable
+      lazyConnect: true,
+      retryDelayOnFailover: 100,
+      maxRetriesPerRequest: 1,
+    });
 
     this.setupToolHandlers();
     this.setupFastifyServer();
@@ -121,7 +133,27 @@ class QuinnMemoryServer {
       timestamp: new Date(),
     };
 
-    this.memories.push(memory);
+    try {
+      // Store in DragonflyDB
+      const memoryKey = `memory:${userId}:${memory.id}`;
+      const memoryData = JSON.stringify({
+        id: memory.id,
+        content: memory.content,
+        userId: memory.userId,
+        timestamp: memory.timestamp.toISOString(),
+      });
+      
+      await this.redis.set(memoryKey, memoryData);
+      
+      // Add to user's memory list for search
+      await this.redis.zadd(`memories:${userId}`, Date.now(), memory.id);
+      
+      console.log(`Memory stored in DragonflyDB: ${memoryKey}`);
+    } catch (error) {
+      console.error('DragonflyDB error, using fallback:', error);
+      // Fallback to in-memory storage
+      this.memories.push(memory);
+    }
 
     return {
       content: [
@@ -141,19 +173,50 @@ class QuinnMemoryServer {
 
     const { query, userId } = schema.parse(args);
 
-    const userMemories = this.memories.filter(m => m.userId === userId);
-    const relevantMemories = userMemories.filter(memory =>
-      memory.content.toLowerCase().includes(query.toLowerCase())
-    );
+    let results: any[] = [];
 
-    const results = relevantMemories
-      .sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime())
-      .slice(0, 10)
-      .map(memory => ({
-        id: memory.id,
-        content: memory.content,
-        timestamp: memory.timestamp.toISOString(),
-      }));
+    try {
+      // Search in DragonflyDB
+      const memoryIds = await this.redis.zrevrange(`memories:${userId}`, 0, 99); // Get last 100 memories
+      const memories = [];
+      
+      for (const memoryId of memoryIds) {
+        const memoryKey = `memory:${userId}:${memoryId}`;
+        const memoryData = await this.redis.get(memoryKey);
+        if (memoryData) {
+          const memory = JSON.parse(memoryData);
+          if (memory.content.toLowerCase().includes(query.toLowerCase())) {
+            memories.push({
+              id: memory.id,
+              content: memory.content,
+              timestamp: memory.timestamp,
+            });
+          }
+        }
+      }
+      
+      results = memories
+        .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
+        .slice(0, 10);
+        
+      console.log(`Found ${results.length} memories in DragonflyDB for query: ${query}`);
+    } catch (error) {
+      console.error('DragonflyDB error, using fallback:', error);
+      // Fallback to in-memory search
+      const userMemories = this.memories.filter(m => m.userId === userId);
+      const relevantMemories = userMemories.filter(memory =>
+        memory.content.toLowerCase().includes(query.toLowerCase())
+      );
+
+      results = relevantMemories
+        .sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime())
+        .slice(0, 10)
+        .map(memory => ({
+          id: memory.id,
+          content: memory.content,
+          timestamp: memory.timestamp.toISOString(),
+        }));
+    }
 
     return {
       content: [
@@ -202,7 +265,20 @@ class QuinnMemoryServer {
 
     // Health check endpoint
     this.fastifyServer.get('/health', async () => {
-      return { status: 'healthy', timestamp: new Date().toISOString() };
+      let dragonflyStatus = 'unavailable';
+      try {
+        await this.redis.ping();
+        dragonflyStatus = 'connected';
+      } catch (error) {
+        console.error('DragonflyDB health check failed:', error);
+      }
+      
+      return { 
+        status: 'healthy', 
+        timestamp: new Date().toISOString(),
+        dragonfly: dragonflyStatus,
+        fallback: dragonflyStatus === 'unavailable' ? 'in-memory' : 'not needed'
+      };
     });
 
     // MCP HTTP transport endpoint
