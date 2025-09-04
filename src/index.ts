@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import fastify from "fastify";
+import cors from "@fastify/cors";
 import { z } from "zod";
 import Redis from "ioredis";
 
@@ -14,23 +15,16 @@ interface Memory {
 }
 
 class QuinnMemoryServer {
-  private server: Server;
+  private server: McpServer;
   private memories: Memory[] = [];
   private fastifyServer: any;
   private redis: Redis;
 
   constructor() {
-    this.server = new Server(
-      {
-        name: "quinn-memory-mcp-server",
-        version: "1.0.0",
-      },
-      {
-        capabilities: {
-          tools: {},
-        },
-      }
-    );
+    this.server = new McpServer({
+      name: "quinn-memory-mcp-server",
+      version: "1.0.0",
+    });
 
     // Initialize Redis/DragonflyDB connection
     this.redis = new Redis({
@@ -38,7 +32,6 @@ class QuinnMemoryServer {
       port: parseInt(process.env.DRAGONFLY_PORT || '6379'),
       // Fallback to in-memory if Redis unavailable
       lazyConnect: true,
-      retryDelayOnFailover: 100,
       maxRetriesPerRequest: 1,
     });
 
@@ -47,75 +40,37 @@ class QuinnMemoryServer {
   }
 
   private setupToolHandlers() {
-    // Add memory tool
-    this.server.setRequestHandler("tools/list", async () => ({
-      tools: [
-        {
-          name: "add-memory",
-          description: "Add a new memory for a user",
-          inputSchema: {
-            type: "object",
-            properties: {
-              content: {
-                type: "string",
-                description: "The content to store in memory",
-              },
-              userId: {
-                type: "string",
-                description: "User ID for memory storage. Defaults to 'quinn_may' if not provided.",
-                default: "quinn_may",
-              },
-            },
-            required: ["content"],
-          },
-        },
-        {
-          name: "search-memories",
-          description: "Search through stored memories for a user",
-          inputSchema: {
-            type: "object",
-            properties: {
-              query: {
-                type: "string",
-                description: "The search query to find relevant memories",
-              },
-              userId: {
-                type: "string",
-                description: "User ID for memory storage. Defaults to 'quinn_may' if not provided.",
-                default: "quinn_may",
-              },
-            },
-            required: ["query"],
-          },
-        },
-      ],
-    }));
-
-    // Tool execution handler
-    this.server.setRequestHandler("tools/call", async (request) => {
-      const { name, arguments: args } = request.params;
-
-      try {
-        if (name === "add-memory") {
-          return await this.addMemory(args);
-        } else if (name === "search-memories") {
-          return await this.searchMemories(args);
-        } else {
-          throw new McpError(
-            ErrorCode.MethodNotFound,
-            `Unknown tool: ${name}`
-          );
+    // Register add-memory tool
+    this.server.registerTool(
+      "add-memory",
+      {
+        title: "Add Memory",
+        description: "Add a new memory. This method is called everytime the user informs anything about themselves, their preferences, or anything that has any relevent information whcih can be useful in the future conversation. This can also be called when the user asks you to remember something.",
+        inputSchema: {
+          content: z.string(),
+          userId: z.string().default("quinn_may"),
         }
-      } catch (error) {
-        if (error instanceof McpError) {
-          throw error;
-        }
-        throw new McpError(
-          ErrorCode.InternalError,
-          `Tool execution failed: ${error}`
-        );
+      },
+      async ({ content, userId }) => {
+        return await this.addMemory({ content, userId });
       }
-    });
+    );
+
+    // Register search-memories tool  
+    this.server.registerTool(
+      "search-memories",
+      {
+        title: "Search Memories",
+        description: "Search through stored memories. This method is called ANYTIME the user asks anything.",
+        inputSchema: {
+          query: z.string(),
+          userId: z.string().default("quinn_may"),
+        }
+      },
+      async ({ query, userId }) => {
+        return await this.searchMemories({ query, userId });
+      }
+    );
   }
 
   private async addMemory(args: any) {
@@ -158,7 +113,7 @@ class QuinnMemoryServer {
     return {
       content: [
         {
-          type: "text",
+          type: "text" as const,
           text: `Memory added successfully for user ${userId}. Memory ID: ${memory.id}`,
         },
       ],
@@ -221,7 +176,7 @@ class QuinnMemoryServer {
     return {
       content: [
         {
-          type: "text",
+          type: "text" as const,
           text: `Found ${results.length} memories for query "${query}":\n\n${results
             .map((r, i) => `${i + 1}. [${r.timestamp}] ${r.content}`)
             .join("\n")}`,
@@ -236,7 +191,7 @@ class QuinnMemoryServer {
     });
 
     // CORS configuration for MCP
-    await this.fastifyServer.register(require('@fastify/cors'), {
+    await this.fastifyServer.register(cors, {
       origin: true,
       credentials: true,
       exposedHeaders: ['Mcp-Session-Id'],
@@ -284,26 +239,32 @@ class QuinnMemoryServer {
     // MCP HTTP transport endpoint
     this.fastifyServer.post('/mcp', async (request: any, reply: any) => {
       try {
-        const sessionId = request.headers['mcp-session-id'] || 'stateless';
-        
-        // Set session ID header for response
-        reply.header('Mcp-Session-Id', sessionId);
-        reply.header('Content-Type', 'application/json');
+        // Create stateless transport for each request
+        const transport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: undefined, // Stateless mode
+        });
 
-        // Process MCP request through the server
-        const response = await this.server.request(request.body);
-        return response;
+        // Set up connection cleanup
+        reply.raw.on('close', () => {
+          transport.close();
+        });
+
+        // Connect the server to transport and handle the request
+        await this.server.connect(transport);
+        await transport.handleRequest(request.raw, reply.raw, request.body);
       } catch (error) {
         console.error('MCP request error:', error);
-        reply.code(500).send({
-          jsonrpc: "2.0",
-          error: {
-            code: -32603,
-            message: "Internal error",
-            data: error instanceof Error ? error.message : String(error),
-          },
-          id: request.body?.id || null,
-        });
+        if (!reply.sent) {
+          reply.code(500).send({
+            jsonrpc: "2.0",
+            error: {
+              code: -32603,
+              message: "Internal error",
+              data: error instanceof Error ? error.message : String(error),
+            },
+            id: request.body?.id || null,
+          });
+        }
       }
     });
 
